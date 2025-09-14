@@ -1,0 +1,8 @@
+{
+  "spring_bright": {
+    "base": ["#FFF7E6", "#FDF0D5", "#EED9B6", "#FFE48A", "#C98A3F", "#103A64"],
+    "accent": ["#FF6B5C", "#FF3B30", "#FFA07A", "#FFC107", "#5CD85C", "#58E0C0", "#6DCFF6", "#0BB3A6"],
+    "avoid": ["#B5B5B5", "#B9AA96", "#7DA1B1", "#B08BA0", "#444444"]
+  }
+}
+
