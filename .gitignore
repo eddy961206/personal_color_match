@@ -1,1 +1,4 @@
 /req.md
+.venv/
+.env
+__pycache__/

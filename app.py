@@ -14,7 +14,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
 import gradio as gr
 import numpy as np
@@ -35,16 +35,6 @@ HEX_RE = re.compile(r"^#([0-9A-Fa-f]{6})$")
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-
-def triangular(x: float, a: float, b: float, c: float) -> float:
-    """삼각 함수형 멤버십: a~b 상승, b 정점, b~c 하강 (범위 밖 0)."""
-    if x <= a or x >= c:
-        return 0.0
-    if x == b:
-        return 1.0
-    if x < b:
-        return (x - a) / (b - a)
-    return (c - x) / (c - b)
 
 
 def validate_hex(s: str) -> bool:
@@ -102,11 +92,19 @@ def load_palette(path: str = "palette.json") -> Dict:
         return json.load(f)
 
 
-def nearest_palette(hex_color: str, palette: Dict) -> Tuple[str, float, str]:
-    """가장 가까운 팔레트 색상 HEX, DeltaE, 분류(base|accent|avoid)를 반환."""
+def nearest_palette(
+    hex_color: str,
+    palette: Dict,
+    include: Iterable[str] = ("base", "accent"),
+) -> Tuple[str, float, str]:
+    """가장 가까운 팔레트 색상 HEX, DeltaE, 분류를 반환.
+
+    include로 카테고리 집합을 제한할 수 있다. 기본은 (base, accent)만 사용.
+    경고 판단은 별도로 avoid에 대해 계산한다.
+    """
     lab = hex_to_lab(hex_color)
     best_hex, best_d, best_cat = None, 1e9, ""
-    for cat in ("base", "accent", "avoid"):
+    for cat in include:
         for h in palette["spring_bright"][cat]:
             d = delta_e_ciede2000(lab, hex_to_lab(h))
             if d < best_d:
@@ -128,15 +126,65 @@ def score_color(hex_color: str, palette: Dict) -> Dict:
     r, g, b = hex_to_rgb(hex_color)
     lab = rgb_to_lab(r, g, b)
 
-    # 팔레트와의 최소 거리
-    best_hex, best_d, best_cat = nearest_palette(hex_color, palette)
+    # 팔레트 멤버십(정확 일치) 확인
+    hex_up = hex_color.strip().upper()
+    pal = palette["spring_bright"]
+    in_base = hex_up in [h.upper() for h in pal["base"]]
+    in_accent = hex_up in [h.upper() for h in pal["accent"]]
+    in_avoid = hex_up in [h.upper() for h in pal["avoid"]]
 
-    # HSV 보정
+    # 팔레트(base+accent)와의 최소 거리만으로 근접도 평가
+    best_hex, best_d, best_cat = nearest_palette(hex_color, palette, include=("base", "accent"))
+
+    # 피해야 할 색과의 거리(점수 페널티 및 경고 판단)
+    avoid_d = 1e9
+    for h in palette["spring_bright"]["avoid"]:
+        d = delta_e_ciede2000(lab, hex_to_lab(h))
+        if d < avoid_d:
+            avoid_d = d
+    # 경고 임계값을 보수적으로 낮춤(과도 경고 방지)
+    AVOID_WARN_DE = 12.0
+    avoid_near = avoid_d < AVOID_WARN_DE
+    avoid_penalty = 0.0
+    if avoid_near:
+        # 근접도가 높을수록 강한 감점(6 미만은 매우 유사로 간주)
+        if avoid_d < 6.0:
+            avoid_penalty = 1.0
+        elif avoid_d < 10.0:
+            avoid_penalty = 0.7
+        else:
+            avoid_penalty = 0.4
+
+    # HSV/CIELAB 기반 보정값
     _, s, v = rgb_to_hsv01(r, g, b)
-    s1 = max(0.0, 1.0 - best_d / 60.0)  # 팔레트 근접도
-    s2 = clamp((s - 0.45) / 0.55, 0.0, 1.0)  # 채도 보정
-    s3 = triangular(v, 0.60, 0.80, 0.95)  # 밝기 선호
-    score = round(100.0 * (0.65 * s1 + 0.20 * s2 + 0.15 * s3))
+    chroma = float(np.hypot(lab[1], lab[2]))
+
+    s1 = max(0.0, 1.0 - best_d / 45.0)  # 팔레트 근접도
+    s2 = clamp((s - 0.38) / 0.42, 0.0, 1.0)  # 채도(선명도) 선호
+    s3 = clamp((v - 0.55) / 0.40, 0.0, 1.0)  # 밝기 선호
+    s4 = clamp((chroma - 38.0) / 32.0, 0.0, 1.0)  # 고채도 색 선호
+
+    raw_score = 0.55 * s1 + 0.20 * s2 + 0.15 * s3 + 0.10 * s4
+    # 회피 색상 근접도에 따라 강한 감점
+    raw_score *= (1.0 - 0.50 * avoid_penalty)
+
+    score = round(100.0 * raw_score)
+
+    # 캘리브레이션 규칙
+    # 1) 팔레트 정확 매치는 100점으로 보정
+    if in_base or in_accent:
+        score = 100
+        avoid_near = False  # 정확 매치 시 경고 표시하지 않음
+    # 2) 팔레트에 매우 근접하면 상향 보정(채도/밝기 페널티 제거 효과)
+    elif best_d < 3.0:
+        score = max(score, 96)
+    elif best_d < 6.0:
+        score = max(score, 90)
+
+    # 3) 피해야 할 색상 정확 매치면 강한 하향
+    if in_avoid:
+        score = 0
+        avoid_near = True
 
     # 판정 라벨
     if score >= 90:
@@ -147,14 +195,6 @@ def score_color(hex_color: str, palette: Dict) -> Dict:
         label = "보통(상황에 따라 가능)"
     else:
         label = "비추천(탁하거나 톤 안맞음)"
-
-    # 피해야 할 색과의 유사도 체크
-    avoid_d = 1e9
-    for h in palette["spring_bright"]["avoid"]:
-        d = delta_e_ciede2000(lab, hex_to_lab(h))
-        if d < avoid_d:
-            avoid_d = d
-    avoid_near = avoid_d < 20.0
 
     return {
         "score": int(score),
@@ -268,8 +308,8 @@ def render_nearest(hex_color: str, delta_e: float, cat: str) -> str:
     '''
 
 
-def render_top_colors(rows: List[Tuple[str, int, int, float]]) -> str:
-    # rows: (HEX, 픽셀수, 점수, deltaE)
+def render_top_colors(rows: List[Tuple[str, int, int, float]], method: Optional[str] = None) -> str:
+    # rows: (HEX, 픽셀수, 점수, deltaE), method: "Gemini" 또는 "KMeans"
     if not rows:
         return ""
     trs = []
@@ -285,9 +325,10 @@ def render_top_colors(rows: List[Tuple[str, int, int, float]]) -> str:
             </tr>
             """
         )
+    method_badge = f"<span style='margin-left:8px;font-size:12px;padding:2px 6px;border:1px solid #ddd;border-radius:9999px;background:#f7f7f7'>{method}</span>" if method else ""
     table = f"""
     <div>
-      <div style='margin-bottom:6px;font-weight:600'>상위 3색 후보</div>
+      <div style='margin-bottom:6px;font-weight:600'>상위 3색 후보 {method_badge}</div>
       <table style='border-collapse:collapse;width:100%;'>
         <thead>
           <tr style='text-align:left;border-bottom:1px solid #ddd'>
@@ -313,11 +354,45 @@ def render_avoid_warning(show: bool) -> str:
     )
 
 
+def render_palette_panel(palette: Dict) -> str:
+    colors = palette["spring_bright"]
+
+    def swatch(hex_color: str) -> str:
+        return (
+            "<div style='display:flex;flex-direction:column;align-items:center;gap:6px;width:90px;'>"
+            f"<div style='width:72px;height:72px;border:1px solid #d0d0d0;border-radius:10px;background:{hex_color}'></div>"
+            f"<code style='font-size:12px'>{hex_color}</code>"
+            "</div>"
+        )
+
+    sections = []
+    for title, desc, clist in [
+        ("베이스", "밝고 따뜻한 피부톤과 조화로운 기본 컬러", colors["base"]),
+        ("엑센트", "포인트로 쓰기 좋은 생기 있는 컬러", colors["accent"]),
+        ("피해야 할", "톤을 탁하게 만드는 회색기/저채도 컬러", colors["avoid"]),
+    ]:
+        body = "".join(swatch(c) for c in clist)
+        sections.append(
+            "<div style='flex:1;min-width:240px;max-width:100%;'>"
+            f"<div style='font-weight:600;margin-bottom:6px;'>{title}</div>"
+            f"<div style='font-size:12px;color:#666;margin-bottom:10px;'>{desc}</div>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:12px;'>{body}</div>"
+            "</div>"
+        )
+
+    return (
+        "<div style='display:flex;flex-wrap:wrap;gap:20px;margin-top:16px;'>"
+        + "".join(sections)
+        + "</div>"
+    )
+
+
 # -----------------------------
 # Gradio 앱 로직
 # -----------------------------
 
 PALETTE = load_palette()
+PALETTE_HTML = render_palette_panel(PALETTE)
 
 
 def sync_from_hex(hex_in: str):
@@ -391,12 +466,22 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
                     provider = GeminiProvider(api_key=api_key)
                     hex_list = provider.get_main_colors(img)
                     used_llm = True
+                    print(f"[정보] LLM 추출 사용(Gemini): {hex_list}")
+                    try:
+                        gr.Info("Gemini로 이미지 색을 추출했어.")
+                    except Exception:
+                        pass
                 except Exception as e:
                     print("[경고] LLM 추출 실패, KMeans로 폴백합니다:", str(e))
+                    try:
+                        gr.Warning("Gemini 추출에 실패해서 KMeans로 대신 분석했어.")
+                    except Exception:
+                        pass
             if not hex_list:
                 # KMeans 폴백
                 krows = extract_colors_kmeans(img, k=5)
                 hex_list = [h for h, _ in krows[:3]]
+                print(f"[정보] KMeans 추출 사용: {[h for h,_ in krows]}")
 
             # 상위색 평가 테이블 작성 및 첫 번째 색을 대표로 사용
             rows = []
@@ -410,7 +495,7 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
                 for h in hex_list:
                     met = score_color(h, PALETTE)
                     rows.append((h, 0, met["score"], met["nearest_delta_e"]))
-            table_html = render_top_colors(rows)
+            table_html = render_top_colors(rows, method=("Gemini" if used_llm else "KMeans"))
 
             # 대표 색 선택: 첫 번째
             if hex_list:
@@ -423,7 +508,8 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
             met = score_color(chosen_hex, PALETTE)
             sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
             score_html = render_score(met["score"], met["label"]) 
-            nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE)
+            nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
+            print(f"[정보] 대표색 {chosen_hex}의 가까운 팔레트: {nearest_hex} ({cat}), DeltaE={nearest_de:.1f}")
             nearest_html = render_nearest(nearest_hex, nearest_de, cat)
             warn_html = render_avoid_warning(met["avoid_near"]) 
 
@@ -445,7 +531,8 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
         met = score_color(chosen_hex, PALETTE)
         sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
         score_html = render_score(met["score"], met["label"]) 
-        nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE)
+        nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
+        print(f"[정보] 입력색 {chosen_hex}의 가까운 팔레트: {nearest_hex} ({cat}), DeltaE={nearest_de:.1f}")
         nearest_html = render_nearest(nearest_hex, nearest_de, cat)
         warn_html = render_avoid_warning(met["avoid_near"]) 
         # 단일 색이므로 상위 3색 표는 비움
@@ -479,7 +566,11 @@ def build_ui():
                     g_in = gr.Number(label="G", value=107, precision=0)
                     b_in = gr.Number(label="B", value=92, precision=0)
                 img_in = gr.Image(label="이미지 업로드", type="pil")
-                api_key = gr.Textbox(label="Gemini API 키 (선택)", type="password")
+                api_key = gr.Textbox(
+                    label="Gemini API 키 (이미지 색 추출용, 선택)",
+                    type="password",
+                    info="이미지 업로드 시 상위 3색을 LLM으로 추출해. 유효한 HEX/RGB를 입력한 경우엔 LLM을 쓰지 않아. 오류나 미설치 시 자동으로 KMeans로 전환돼."
+                )
                 analyze_btn = gr.Button("분석하기")
 
             with gr.Column(scale=1):
@@ -488,6 +579,7 @@ def build_ui():
                 nearest_out = gr.HTML(label="가까운 팔레트")
                 top_colors_out = gr.HTML(label="상위 3색")
                 warn_out = gr.HTML(label="경고")
+                gr.HTML(value=PALETTE_HTML, label="팔레트 미리보기")
 
         # 동기화 이벤트: HEX -> RGB/스와치
         hex_in.change(fn=sync_from_hex, inputs=[hex_in], outputs=[r_in, g_in, b_in, swatch_out])
