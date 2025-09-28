@@ -20,7 +20,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
 def validate_hex(s: str) -> bool:
     return bool(HEX_RE.match((s or "").strip()))
 
-
+  
 def _try_css_to_hex(s: str) -> Optional[str]:
     match = CSS_RGB_RE.match(s)
     if not match:
@@ -56,7 +56,6 @@ def normalize_color_input(s: str) -> Optional[str]:
     if css:
         return css
     return None
-
 
 def hex_to_rgb(s: str) -> Tuple[int, int, int]:
     m = HEX_RE.match((s or "").strip())
