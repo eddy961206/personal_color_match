@@ -13,6 +13,7 @@ from sklearn.cluster import KMeans
 from color_utils import (
     clamp,
     hex_to_rgb,
+    normalize_color_input,
     rgb_to_hex,
     rgb_to_hsv01,
     validate_hex,
@@ -301,7 +302,8 @@ def pack_color_outputs(
 
 
 def on_hex_change(hex_value: str, tone_id: str):
-    if not validate_hex(hex_value):
+    normalized = normalize_color_input(hex_value)
+    if not normalized:
         gr.Warning("HEX 형식이 올바르지 않아. 예: #FF6B5C")
         return (
             hex_value,
@@ -318,8 +320,8 @@ def on_hex_change(hex_value: str, tone_id: str):
             gr.update(),
             gr.update(),
         )
-    outputs = compute_score(hex_value.upper(), tone_id)
-    return pack_color_outputs(hex_value.upper(), outputs)
+    outputs = compute_score(normalized, tone_id)
+    return pack_color_outputs(normalized, outputs)
 
 
 def on_rgb_change(r: float, g: float, b: float, tone_id: str):

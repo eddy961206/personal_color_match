@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image
 from skimage import color as skcolor
 
 HEX_RE = re.compile(r"^#([0-9A-Fa-f]{6})$")
+HEX_SHORT_RE = re.compile(r"^([0-9A-Fa-f]{6})$")
+CSS_RGB_RE = re.compile(r"^rgba?\(([^)]+)\)$", re.IGNORECASE)
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -18,6 +20,42 @@ def clamp(x: float, lo: float, hi: float) -> float:
 def validate_hex(s: str) -> bool:
     return bool(HEX_RE.match((s or "").strip()))
 
+  
+def _try_css_to_hex(s: str) -> Optional[str]:
+    match = CSS_RGB_RE.match(s)
+    if not match:
+        return None
+    parts = [p.strip() for p in match.group(1).split(",")]
+    if len(parts) < 3:
+        return None
+    try:
+        r = int(round(float(parts[0])))
+        g = int(round(float(parts[1])))
+        b = int(round(float(parts[2])))
+    except ValueError:
+        return None
+    if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+        return None
+    return rgb_to_hex(r, g, b)
+
+
+def normalize_color_input(s: str) -> Optional[str]:
+    """CSS 색상 문자열을 HEX(#RRGGBB) 형태로 정규화한다."""
+
+    if not s:
+        return None
+    candidate = s.strip()
+    if not candidate:
+        return None
+    if validate_hex(candidate):
+        return candidate.upper()
+    short_match = HEX_SHORT_RE.match(candidate)
+    if short_match:
+        return f"#{short_match.group(1).upper()}"
+    css = _try_css_to_hex(candidate)
+    if css:
+        return css
+    return None
 
 def hex_to_rgb(s: str) -> Tuple[int, int, int]:
     m = HEX_RE.match((s or "").strip())
