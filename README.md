@@ -1,46 +1,62 @@
-# 봄 브라이트 컬러 매칭 (Try Spring Bright!)
+# 봄 브라이트 실시간 컬러 매칭
 
-간단한 퍼스널컬러 판별 MVP 웹앱입니다. 봄 브라이트(Spring Bright) 톤에 맞는지 점수로 보여주고, 가까운 팔레트 색상을 안내합니다. 이미지 업로드 후 자동 색 추출(KMeans)과 이미지 클릭 스포이드도 지원합니다. Gemini API 키가 있으면 LLM으로 주요 색상 3개를 자동 추출할 수 있습니다.
+![색상환 미리보기](docs/colorwheel_preview.png)
+![일치도 게이지](docs/gauge_preview.png)
 
-## 설치 및 실행
+실시간 150ms 디바운스 채점과 색상환·게이지 피드백으로 봄 브라이트(Spring Bright) 톤 적합도를 직관적으로 확인하는 Gradio 웹앱이야.
+HEX/RGB 피커, 이미지 색 추출, 대안 추천까지 한 화면에서 제공해서 "지금 고른 색이 나에게 어울리는가?"를 바로 판단할 수 있어.
 
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
+> 위 미리보기 이미지는 `docs/colorwheel_preview.png`, `docs/gauge_preview.png`에서 바로 확인할 수 있어.
 
-pip install -r requirements.txt
+## 봄 브라이트란?
+- 따뜻한 웜 기운이 두드러지고 노랑~코랄~웜 청록 영역의 색이 혈색을 살려줘.
+- 채도가 중~고 수준이라 색이 흐릿하면 얼굴이 칙칙해지기 쉬워.
+- 명도는 중상~상 정도가 안정적이며, 너무 어두우면 대비감이 떨어져.
+- 맑고 투명한 느낌을 유지해야 해서 회색기(저채도)를 피하는 게 핵심이야.
+- 살짝 밝은 베이스에 선명한 엑센트를 얹어 대비를 주면 생기있는 이미지를 만들 수 있어.
+- 쿨 계열로 기울면 혈색이 빠져 보이니 웜 축을 지키면서 채도/명도를 조절해봐.
 
-# 선택: 환경변수로 Gemini API 키 설정 (UI 입력이 우선)
-# macOS/Linux:
-export GEMINI_API_KEY=your_key
-# Windows PowerShell:
-# $env:GEMINI_API_KEY="your_key"
-# Windows CMD:
-# set GEMINI_API_KEY=your_key
+## 사용 방법
+1. **분석 톤 선택**: 상단 드롭다운에서 분석할 톤을 고를 수 있어(현재는 봄 브라이트만 제공하지만 구조는 확장형이야).
+2. **색 입력**: HEX 텍스트, 컬러 피커, RGB 슬라이더 중 마음에 드는 방식으로 색을 입력하면 150ms 디바운스로 점수와 라벨이 즉시 갱신돼.
+3. **시각 피드백**: 게이지/배지, 색상환 미니맵, 팔레트 미리보기(베이스/엑센트/피해야 할)에서 현재 위치를 확인할 수 있어.
+4. **대안 추천**: 점수가 낮으면 채도/명도/웜 기울기 보정 근거와 함께 팔레트 대체 3색을 제안해줘.
+5. **이미지 활용**: 이미지를 올리면 K-Means로 상위 3색을 추출하고, 마커로 위치를 표시해. 이미지 위를 드래그하면 선택 영역 평균색을 채점하면서 로그에 기록해줘.
+6. **로그 확인**: 콘솔에는 `ΔE`, HSV 보정, 대비 보너스가 포함된 한국어 로그가 남아서 튜닝할 때 도움이 돼.
 
-python app.py
-```
+## 알고리즘 개요
+- 기본 거리는 **CIEDE2000 ΔE**로 계산해서 팔레트와의 색 차이를 정밀하게 반영해.
+- HSV 보정은 `warm_bias`, `saturation_weight`, `value_weight` 파라미터로 조절 가능한 웜/채도/명도 가중치를 사용해.
+- 피해야 할 색상은 ΔE 기반 가우시안 커브(σ=6.5)로 연속 감점을 적용해서 경계 불연속을 없앴어.
+- 대비 보너스(`contrast_pref`, `contrast_bonus_max`)는 베이스/엑센트와의 예상 명암 차이에 따라 ±3점 이내에서 가산해.
+- 파라미터들은 `config.py`의 `ScoringConfig`에서 한 번에 관리하고, 변경 시 로그로 확인 가능해.
 
-## 사용법
+## 팔레트 확장 방법
+1. `palettes/` 디렉터리에 `<tone_id>.json`을 추가하고 `palette.schema.json` 규약에 맞춰 `tone_id`, `display_name`, `groups`(base/accent/avoid)를 채워.
+2. 각 색상 항목은 `{ "name", "hex", "tags" }` 구조를 따르고, `tags`는 Avoid 경고 문구에 활용돼.
+3. `config.py`의 `TONE_DISPLAY_ORDER`에 `(tone_id, 표시 이름)`을 추가하면 드롭다운에 노출돼.
+4. 필요하면 `docs/`에 미리보기 이미지를 추가해서 README에 연결할 수도 있어.
 
-- 좌측에서 HEX/RGB를 입력하거나 이미지를 업로드합니다.
-- 이미지를 클릭하면 해당 픽셀의 색상이 자동으로 채워집니다.
-- 분석하기를 누르면 점수(0~100), 판정 라벨, 가까운 팔레트 색상을 확인할 수 있습니다.
-- 이미지 업로드 시 상위 3색 후보와 각 점수를 표로 보여줍니다.
-- 회색/멜란지/스모키/차콜 계열은 점수가 낮게 나올 수 있습니다.
+## 개발 & 테스트
+1. **환경 구성**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Windows는 .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+2. **실행**
+   ```bash
+   python app.py
+   ```
+   - 기본 UI는 http://localhost:7860 에서 확인 가능해.
+3. **테스트**
+   ```bash
+   pytest
+   ```
+   - 대표 색이 85점 이상, Avoid 색이 40점 이하인지, 채도/명도 상승 시 점수가 오르는지 회귀 테스트로 검증해.
+4. **튜닝 가이드**
+   - `config.py`에서 파라미터를 조정하고, 콘솔 로그(`ΔE`, `HSV보정`, `대비보너스`)를 확인하면서 적합도를 맞춰봐.
+   - 팔레트 추가 시 `palettes/` 구조만 맞추면 UI/알고리즘이 그대로 재사용돼.
 
-## 기능 요약
-
-- 입력: HEX/RGB, 이미지 업로드, 이미지 클릭 스포이드
-- 자동 추출: KMeans(n=3~5) + 저채도/저밝기 필터링
-- 점수: CIELAB + DeltaE (CIEDE2000) + HSV 보정
-- LLM(선택): Gemini 사용 시 주요 색상 3개를 JSON으로 받음 (키 없으면 KMeans 폴백)
-
-## 참고
-
-- 모든 주석/콘솔 로그는 한국어로 작성되어 있습니다.
-- 팔레트는 `palette.json`에서 수정/확장할 수 있습니다.
-- LLM Provider는 `llm_providers.py`에 구현되어 있으며 확장 가능합니다.
-
+## 변경 이력
+- [CHANGELOG.md](CHANGELOG.md)를 참고해서 버전별 개선 사항을 확인해줘.

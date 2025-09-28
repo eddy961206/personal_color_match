@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Personal Color Palette Schema",
+  "type": "object",
+  "properties": {
+    "tone_id": {
+      "type": "string",
+      "description": "팔레트 식별자 (예: spring_bright)"
+    },
+    "display_name": {
+      "type": "string",
+      "description": "UI에 노출될 톤 이름"
+    },
+    "groups": {
+      "type": "object",
+      "required": ["base", "accent", "avoid"],
+      "properties": {
+        "base": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/paletteColor" }
+        },
+        "accent": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/paletteColor" }
+        },
+        "avoid": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/paletteColor" }
+        }
+      }
+    }
+  },
+  "required": ["tone_id", "display_name", "groups"],
+  "definitions": {
+    "paletteColor": {
+      "type": "object",
+      "required": ["name", "hex"],
+      "properties": {
+        "name": { "type": "string" },
+        "hex": {
+          "type": "string",
+          "pattern": "^#([0-9A-Fa-f]{6})$"
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "색상에 대한 설명 태그"
+        }
+      }
+    }
+  }
+}
