@@ -390,9 +390,9 @@ def on_image_upload(img: Image.Image, tone_id: str):
     return table_html, annotated
 
 
-def on_image_select_event(img: Image.Image, evt: gr.SelectData, tone_label: str):
+def on_image_select_event(img: Image.Image, tone_label: str):
     tone_id = resolve_tone_id(tone_label)
-    if img is None or evt is None:
+    if img is None:
         return (
             gr.update(),
             gr.update(),
@@ -408,29 +408,19 @@ def on_image_select_event(img: Image.Image, evt: gr.SelectData, tone_label: str)
             gr.update(),
             gr.update(),
         )
-    box = getattr(evt, "bounding_box", None) or getattr(evt, "region", None)
-    if not box:
-        points = getattr(evt, "selected_points", None)
-        if points and len(points) > 1:
-            box = {
-                "x0": min(p[0] for p in points),
-                "y0": min(p[1] for p in points),
-                "x1": max(p[0] for p in points),
-                "y1": max(p[1] for p in points),
-            }
-    if box:
-        x0 = int(box.get("x0", box.get("x", 0)))
-        y0 = int(box.get("y0", box.get("y", 0)))
-        x1 = int(box.get("x1", box.get("x", 0) + box.get("width", 0)))
-        y1 = int(box.get("y1", box.get("y", 0) + box.get("height", 0)))
-        hx, rgb = average_color(img, x0, y0, x1, y1)
-        tone = REPO.load(tone_id)
-        breakdown = evaluate_color(hx, tone, REPO, DEFAULT_CONFIG)
-        logger.info("[정보] 선택 영역 평균색: %s (LAB 대비 포함) → %d점", hx, breakdown.score)
-        computed = compute_score(hx, tone_id)
-        boxed = draw_selection_box(img, x0, y0, x1, y1)
-        return pack_color_outputs(hx, computed, annotated=boxed, rgb=rgb)
-    return on_image_click(img, evt, tone_id)
+    # 이벤트 데이터 제거된 환경: 업로드 직후 선택 이벤트가 없을 수 있으므로 중앙 영역 샘플링
+    width, height = img.size
+    cx, cy = width // 2, height // 2
+    size = max(4, min(width, height) // 6)
+    x0, y0 = max(0, cx - size), max(0, cy - size)
+    x1, y1 = min(width, cx + size), min(height, cy + size)
+    hx, rgb = average_color(img, x0, y0, x1, y1)
+    tone = REPO.load(tone_id)
+    breakdown = evaluate_color(hx, tone, REPO, DEFAULT_CONFIG)
+    logger.info("[정보] 중앙 영역 평균색: %s (LAB 대비 포함) → %d점", hx, breakdown.score)
+    computed = compute_score(hx, tone_id)
+    boxed = draw_selection_box(img, x0, y0, x1, y1)
+    return pack_color_outputs(hx, computed, annotated=boxed, rgb=rgb)
 
 
 def build_ui() -> gr.Blocks:
@@ -482,31 +472,26 @@ def build_ui() -> gr.Blocks:
             fn=lambda hx, tone_label: on_hex_change(hx, resolve_tone_id(tone_label)),
             inputs=[hex_box, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
-            debounce=0.15,
         )
         color_picker.input(
             fn=lambda hx, tone_label: on_hex_change(hx, resolve_tone_id(tone_label)),
             inputs=[color_picker, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
-            debounce=0.15,
         )
         r_slider.input(
             fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
             inputs=[r_slider, g_slider, b_slider, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
-            debounce=0.15,
         )
         g_slider.input(
             fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
             inputs=[r_slider, g_slider, b_slider, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
-            debounce=0.15,
         )
         b_slider.input(
             fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
             inputs=[r_slider, g_slider, b_slider, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
-            debounce=0.15,
         )
 
         upload.change(
@@ -516,7 +501,7 @@ def build_ui() -> gr.Blocks:
         )
         upload.select(
             fn=on_image_select_event,
-            inputs=[upload, gr.EventData(), tone_dropdown],
+            inputs=[upload, tone_dropdown],
             outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
         )
 
