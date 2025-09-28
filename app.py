@@ -1,20 +1,8 @@
-"""
-봄 브라이트(Spring Bright) 퍼스널컬러 매칭 MVP (Gradio)
-
-요구사항:
-- 입력: HEX/RGB 직접 입력, 이미지 업로드, 이미지 클릭 스포이드
-- 색상 자동 추출: KMeans (옵션: Gemini API로 LLM 추출)
-- 점수 산정: DeltaE(CIEDE2000) + HSV 보정
-- 출력: 스와치, 점수/라벨, 가까운 팔레트, 상위 3색 표, 피해야 할 색 경고
-- 모든 주석/로그 한국어
-"""
+"""봄 브라이트 UX/알고리즘 업그레이드 Gradio 앱"""
 from __future__ import annotations
-
-import json
-import os
-import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Iterable
+import logging
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import gradio as gr
 import numpy as np
@@ -22,206 +10,193 @@ from PIL import Image
 from skimage import color as skcolor
 from sklearn.cluster import KMeans
 
-from llm_providers import GeminiProvider
+from color_utils import (
+    clamp,
+    hex_to_rgb,
+    normalize_color_input,
+    rgb_to_hex,
+    rgb_to_hsv01,
+    validate_hex,
+)
+from color_metrics.adjustment import ScoreBreakdown, evaluate_color
+from color_metrics.recommend import suggest_alternatives
+from config import DEFAULT_CONFIG, TONE_DISPLAY_ORDER
+from palette_loader import PaletteRepository
+from ui.colorwheel import generate_colorwheel_image
+from ui.overlays import Marker, average_color, draw_markers, draw_selection_box
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("spring_bright")
+
+REPO = PaletteRepository(Path("palettes"))
+DEFAULT_TONE = TONE_DISPLAY_ORDER[0][0]
+
+LABEL_RULES: List[Tuple[int, str]] = [
+    (90, "최상"),
+    (75, "좋음"),
+    (60, "보통"),
+    (0, "비추천"),
+]
+
+AVOID_REASON_MAP = {
+    "회색기": "회색기(저채도)",
+    "저채도": "회색기(저채도)",
+    "저명도": "저명도(너무 어두움)",
+    "쿨": "쿨 기운 과다",
+    "딥": "저명도(너무 어두움)",
+}
 
 
-# -----------------------------
-# 유틸: 색 변환/검증
-# -----------------------------
-
-HEX_RE = re.compile(r"^#([0-9A-Fa-f]{6})$")
+def tone_options() -> List[Tuple[str, str]]:
+    return TONE_DISPLAY_ORDER
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def resolve_tone_id(label: str) -> str:
+    for tone_id, display in tone_options():
+        if display == label:
+            return tone_id
+    return DEFAULT_TONE
 
 
-
-def validate_hex(s: str) -> bool:
-    return bool(HEX_RE.match((s or "").strip()))
-
-
-def hex_to_rgb(s: str) -> Tuple[int, int, int]:
-    s = s.strip()
-    m = HEX_RE.match(s)
-    if not m:
-        raise ValueError("올바른 HEX 형식이 아닙니다. 예: #FF6B5C")
-    val = m.group(1)
-    r = int(val[0:2], 16)
-    g = int(val[2:4], 16)
-    b = int(val[4:6], 16)
-    return r, g, b
+def label_for_score(score: int) -> str:
+    for threshold, label in LABEL_RULES:
+        if score >= threshold:
+            return label
+    return "비추천"
 
 
-def rgb_to_hex(r: int, g: int, b: int) -> str:
-    if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
-        raise ValueError("RGB 범위는 0~255 입니다.")
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-
-def rgb_to_hsv01(r: int, g: int, b: int) -> Tuple[float, float, float]:
-    arr = np.array([[[r / 255.0, g / 255.0, b / 255.0]]], dtype=float)
-    hsv = skcolor.rgb2hsv(arr)
-    h, s, v = hsv[0, 0]
-    return float(h), float(s), float(v)
-
-
-def rgb_to_lab(r: int, g: int, b: int) -> np.ndarray:
-    arr = np.array([[[r / 255.0, g / 255.0, b / 255.0]]], dtype=float)
-    lab = skcolor.rgb2lab(arr)
-    return lab[0, 0]
-
-
-def hex_to_lab(s: str) -> np.ndarray:
-    r, g, b = hex_to_rgb(s)
-    return rgb_to_lab(r, g, b)
-
-
-def delta_e_ciede2000(lab1: np.ndarray, lab2: np.ndarray) -> float:
-    # skimage는 (N,3) 또는 (M,N,3) 배열을 받는다.
-    d = skcolor.deltaE_ciede2000(lab1.reshape(1, 1, 3), lab2.reshape(1, 1, 3))
-    return float(d[0, 0])
-
-
-# -----------------------------
-# 팔레트 로딩 및 최근접 계산
-# -----------------------------
-
-def load_palette(path: str = "palette.json") -> Dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def nearest_palette(
-    hex_color: str,
-    palette: Dict,
-    include: Iterable[str] = ("base", "accent"),
-) -> Tuple[Dict, float, str]:
-    """가장 가까운 팔레트 색상 정보(dict), DeltaE, 분류를 반환.
-
-    include로 카테고리 집합을 제한할 수 있다. 기본은 (base, accent)만 사용.
-    경고 판단은 별도로 avoid에 대해 계산한다.
+def render_swatch(hex_color: str, rgb: Tuple[int, int, int]) -> str:
+    return f"""
+    <div style='display:flex;align-items:center;gap:16px;'>
+      <div style='width:140px;height:140px;border-radius:16px;border:3px solid #222;background:{hex_color}'></div>
+      <div style='font-size:14px;line-height:1.6'>
+        <div><b>선택 색상</b></div>
+        <div>HEX: <code>{hex_color}</code></div>
+        <div>RGB: <code>{rgb[0]}, {rgb[1]}, {rgb[2]}</code></div>
+        <div style='color:#555;font-size:13px;'>실시간으로 채점 결과가 갱신돼.</div>
+      </div>
+    </div>
     """
-    lab = hex_to_lab(hex_color)
-    best_color, best_d, best_cat = None, 1e9, ""
-    for cat in include:
-        for color_info in palette["spring_bright"][cat]:
-            h = color_info["hex"]
-            d = delta_e_ciede2000(lab, hex_to_lab(h))
-            if d < best_d:
-                best_color, best_d, best_cat = color_info, d, cat
-    return best_color or {"name": "N/A", "hex": "#000000"}, float(best_d), best_cat
 
 
-def get_label_for_score(score: int) -> str:
-    """점수에 따라 판정 라벨을 반환."""
+def _gauge_color(score: int) -> str:
     if score >= 90:
-        return "최상(완전 봄 브라이트)"
-    elif score >= 75:
-        return "좋음(강추)"
-    elif score >= 60:
-        return "보통(상황에 따라 가능)"
-    else:
-        return "비추천(탁하거나 톤 안맞음)"
+        return "linear-gradient(90deg,#FFB347,#FF6B5C)"
+    if score >= 75:
+        return "linear-gradient(90deg,#FFE08A,#FFAA5C)"
+    if score >= 60:
+        return "linear-gradient(90deg,#FFEFB0,#F4D35E)"
+    return "linear-gradient(90deg,#F8D7DA,#E57373)"
 
 
-def score_color(hex_color: str, palette: Dict) -> Dict:
-    """색상 점수 및 라벨 계산.
+def render_score_card(result: ScoreBreakdown) -> str:
+    score = result.score
+    label = label_for_score(score)
+    gauge_color = _gauge_color(score)
+    tooltip = "ΔE는 팔레트와의 색 차이(작을수록 유사). 채도/명도/웜 보정으로 봄 브라이트 특성을 반영."\
+        " 대비 가산점은 조합 시 명암 차이를 고려해." \
 
-    반환 dict:
-    - score: int(0~100)
-    - label: str
-    - nearest_color: {name, hex}
-    - nearest_delta_e: float
-    - avoid_near: bool (DeltaE<20)
-    - avoid_color: {name, hex} | None
-    - hsv: (h,s,v) 0..1
+    return f"""
+    <div style='display:flex;flex-direction:column;gap:12px;'>
+      <div style='display:flex;align-items:center;gap:12px;'>
+        <div style='flex:1;height:22px;border-radius:9999px;background:#eee;overflow:hidden;position:relative;'>
+          <div style='position:absolute;left:0;top:0;height:100%;width:{score}%;background:{gauge_color};transition:width 0.2s;'></div>
+        </div>
+        <div style='font-size:22px;font-weight:700;'>{score}</div>
+        <div style='padding:4px 10px;border-radius:9999px;border:1px solid #444;' title='{tooltip}'>{label}</div>
+      </div>
+      <div style='font-size:13px;color:#555;'>
+        ΔE 최솟값 <b>{result.delta_e:.1f}</b>, HSV 보정 <b>{result.hsv_boost:+.1f}</b>, 회피 페널티 <b>{-result.avoid_penalty:.1f}</b>, 대비 보너스 <b>{result.contrast_bonus:+.1f}</b>
+      </div>
+    </div>
     """
-    r, g, b = hex_to_rgb(hex_color)
-    lab = rgb_to_lab(r, g, b)
-
-    # 팔레트 멤버십(정확 일치) 확인
-    hex_up = hex_color.strip().upper()
-    pal = palette["spring_bright"]
-    in_base = hex_up in [c["hex"].upper() for c in pal["base"]]
-    in_accent = hex_up in [c["hex"].upper() for c in pal["accent"]]
-    in_avoid = hex_up in [c["hex"].upper() for c in pal["avoid"]]
-
-    # 팔레트(base+accent)와의 최소 거리만으로 근접도 평가
-    best_color, best_d, best_cat = nearest_palette(hex_color, palette, include=("base", "accent"))
-
-    # 피해야 할 색과의 거리(점수 페널티 및 경고 판단)
-    avoid_d = 1e9
-    avoid_color = None
-    for c in palette["spring_bright"]["avoid"]:
-        d = delta_e_ciede2000(lab, hex_to_lab(c["hex"]))
-        if d < avoid_d:
-            avoid_d = d
-            avoid_color = c
-    # 경고 임계값을 보수적으로 낮춤(과도 경고 방지)
-    AVOID_WARN_DE = 12.0
-    avoid_near = avoid_d < AVOID_WARN_DE
-    avoid_penalty = 0.0
-    if avoid_near:
-        # 근접도가 높을수록 강한 감점(6 미만은 매우 유사로 간주)
-        if avoid_d < 6.0:
-            avoid_penalty = 1.0
-        elif avoid_d < 10.0:
-            avoid_penalty = 0.7
-        else:
-            avoid_penalty = 0.4
-
-    # HSV/CIELAB 기반 보정값
-    _, s, v = rgb_to_hsv01(r, g, b)
-    chroma = float(np.hypot(lab[1], lab[2]))
-
-    s1 = max(0.0, 1.0 - best_d / 45.0)  # 팔레트 근접도
-    s2 = clamp((s - 0.38) / 0.42, 0.0, 1.0)  # 채도(선명도) 선호
-    s3 = clamp((v - 0.55) / 0.40, 0.0, 1.0)  # 밝기 선호
-    s4 = clamp((chroma - 38.0) / 32.0, 0.0, 1.0)  # 고채도 색 선호
-
-    raw_score = 0.55 * s1 + 0.20 * s2 + 0.15 * s3 + 0.10 * s4
-    # 회피 색상 근접도에 따라 강한 감점
-    raw_score *= (1.0 - 0.50 * avoid_penalty)
-
-    score = round(100.0 * raw_score)
-
-    # 캘리브레이션 규칙
-    # 1) 팔레트 정확 매치는 100점으로 보정
-    if in_base or in_accent:
-        score = 100
-        avoid_near = False  # 정확 매치 시 경고 표시하지 않음
-    # 2) 팔레트에 매우 근접하면 상향 보정(채도/밝기 페널티 제거 효과)
-    elif best_d < 3.0:
-        score = max(score, 96)
-    elif best_d < 6.0:
-        score = max(score, 90)
-
-    # 3) 피해야 할 색상 정확 매치면 강한 하향
-    if in_avoid:
-        score = 0
-        avoid_near = True
-
-    # 판정 라벨
-    label = get_label_for_score(score)
-
-    return {
-        "score": int(score),
-        "label": label,
-        "nearest_color": best_color,
-        "nearest_delta_e": float(best_d),
-        "avoid_near": bool(avoid_near),
-        "avoid_color": avoid_color,
-        "hsv": (float(_), float(s), float(v)),
-    }
 
 
-# -----------------------------
-# 이미지 처리: KMeans / 픽셀 픽
-# -----------------------------
+def render_nearest_info(result: ScoreBreakdown) -> str:
+    nearest = result.nearest
+    return f"""
+    <div style='display:flex;align-items:center;gap:12px;'>
+      <div style='font-weight:600;'>가장 가까운 팔레트</div>
+      <div style='width:26px;height:26px;border-radius:6px;border:2px solid #111;background:{nearest['hex']}'></div>
+      <div>{nearest['name']} <code>{nearest['hex']}</code> ({'베이스' if nearest['group']=='base' else '엑센트'})</div>
+    </div>
+    """
 
-def _resize_longest_side(pil_img: Image.Image, longest: int = 512) -> Image.Image:
-    # 긴 변을 longest로 맞추고 비율 유지
+
+def avoid_message(result: ScoreBreakdown, tone_id: str) -> str:
+    if not result.avoid:
+        return ""
+    tags = result.avoid.get("tags", []) if isinstance(result.avoid, dict) else []
+    reason = next((AVOID_REASON_MAP[tag] for tag in AVOID_REASON_MAP if tag in tags), None)
+    text = reason or "봄 브라이트 이미지가 탁해질 수 있어."
+    return f"""
+    <div style='padding:10px 14px;border-radius:12px;border:1px solid #E57373;background:#FDECEA;color:#C62828;'>
+      <b>주의:</b> {result.avoid['name']}(<code>{result.avoid['hex']}</code>) 색감과 ΔE {result.avoid['distance']:.1f}로 가까워. {text}
+    </div>
+    """
+
+
+def render_palette_panel(tone_id: str, highlight_hex: str | None, avoid_hex: str | None) -> str:
+    tone = REPO.load(tone_id)
+    sections = []
+    for group, title, desc, icon in [
+        ("base", "베이스", "피부와 가장 자연스럽게 어울리는 기본 영역", "🌤"),
+        ("accent", "엑센트", "포인트로 쓰면 생기를 주는 강채도 영역", "✨"),
+        ("avoid", "피해야 할", "탁색/저채도는 혈색을 가려.", "⚠️"),
+    ]:
+        chips = []
+        for color in tone.groups.get(group, []):
+            border = "4px solid #222" if highlight_hex and color.hex.upper() == highlight_hex.upper() else "1px solid #ddd"
+            if avoid_hex and color.hex.upper() == avoid_hex.upper():
+                border = "3px dashed #E57373"
+            chips.append(
+                f"""
+                <div style='flex:1 0 90px;display:flex;flex-direction:column;align-items:center;gap:6px;'>
+                  <div style='width:70px;height:70px;border-radius:12px;border:{border};background:{color.hex}'></div>
+                  <div style='font-size:12px;font-weight:600;text-align:center;'>{color.name}</div>
+                  <code style='font-size:11px'>{color.hex}</code>
+                </div>
+                """
+            )
+        sections.append(
+            f"""
+            <div style='flex:1;min-width:240px;padding:12px;border-radius:12px;border:1px solid #ddd;background:#fff;'>
+              <div style='display:flex;align-items:center;gap:6px;font-weight:700;margin-bottom:4px;'>{icon} {title}</div>
+              <div style='font-size:12px;color:#666;margin-bottom:8px;'>{desc}</div>
+              <div style='display:flex;flex-wrap:wrap;gap:12px;'>{''.join(chips)}</div>
+            </div>
+            """
+        )
+    return "<div style='display:flex;flex-wrap:wrap;gap:16px;'>" + "".join(sections) + "</div>"
+
+
+def render_recommendation_section(result: ScoreBreakdown, tone, current_hex: str) -> str:
+    if result.score >= 85:
+        return "<div style='font-size:13px;color:#4CAF50;'>봄 브라이트 팔레트와 매우 잘 어울려! 추가 추천이 필요 없을 정도야.</div>"
+    recs = suggest_alternatives(current_hex, tone)
+    chips = []
+    for rec in recs:
+        chips.append(
+            f"<span style='padding:6px 10px;border-radius:9999px;border:2px solid #FF6B5C;margin-right:8px;font-weight:600;' title='{rec.reason}'>{rec.name} <code>{rec.hex}</code></span>"
+        )
+    return "<div><b>이 색 대신 →</b> " + " / ".join(chips) + "</div>"
+
+
+def render_help_panel() -> str:
+    return """
+    <div style='display:flex;flex-direction:column;gap:12px;'>
+      <div><b>어떻게 점수를 올리나요?</b></div>
+      <ul style='margin:0;padding-left:18px;font-size:13px;color:#444;'>
+        <li>채도를 살짝 높여서 흐릿함(회색기)을 줄여봐.</li>
+        <li>명도를 0.6 이상으로 끌어올리면 얼굴이 환해 보여.</li>
+        <li>노랑~코랄~웜 청록 사이의 웜 기울기를 유지하면 좋고, 쿨톤으로 빠지면 점수가 낮아져.</li>
+        <li>베이스 대비를 고려해서 너무 어둡거나 탁한 영역은 피하는 게 좋아.</li>
+      </ul>
+    </div>
+    """
+
+
+def _resize_longest_side(pil_img: Image.Image, longest: int = 640) -> Image.Image:
     w, h = pil_img.size
     if max(w, h) <= longest:
         return pil_img
@@ -234,414 +209,321 @@ def _resize_longest_side(pil_img: Image.Image, longest: int = 512) -> Image.Imag
     return pil_img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def extract_colors_kmeans(pil_img: Image.Image, k: int = 5) -> List[Tuple[str, int]]:
-    """KMeans로 지배적 색 추출.
-    반환: List[(HEX, 픽셀수)] (채도/밝기 필터 후, 픽셀수 내림차순)
-    """
-    # 전처리: 리사이즈, RGB 정규화
+def extract_colors_kmeans(pil_img: Image.Image, k: int = 5):
     img = _resize_longest_side(pil_img.convert("RGB"), 512)
     arr = np.asarray(img).astype(np.float32) / 255.0
     h, w, _ = arr.shape
     flat = arr.reshape(-1, 3)
-
-    # KMeans (랜덤 초기화 고정)
     km = KMeans(n_clusters=k, n_init=5, random_state=42)
     labels = km.fit_predict(flat)
-    centers = km.cluster_centers_  # (k,3) 0..1
-
-    # 각 클러스터 픽셀 수
+    centers = km.cluster_centers_
     counts = np.bincount(labels, minlength=k)
 
-    # HSV로 저채도/극저밝기 필터링
     hsv_centers = skcolor.rgb2hsv(centers.reshape(1, k, 3))[0]
-    results: List[Tuple[str, int]] = []
+    rows = []
+    coords = labels.reshape(h, w)
     for i in range(k):
-        h_, s_, v_ = hsv_centers[i]
-        if s_ < 0.2 or v_ < 0.2:
-            # 배경/그늘로 간주하고 제외
+        s = hsv_centers[i, 1]
+        v = hsv_centers[i, 2]
+        if s < 0.18 or v < 0.22:
             continue
         r, g, b = (centers[i] * 255).round().astype(int)
         hex_c = rgb_to_hex(int(r), int(g), int(b))
-        results.append((hex_c, int(counts[i])))
-
-    # 픽셀 수 기준 내림차순 정렬
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results
-
-
-def pick_color_at(pil_img: Image.Image, x: int, y: int) -> str:
-    """이미지 좌표(x,y) 픽셀에서 HEX 색상 추출."""
-    img = pil_img.convert("RGB")
-    w, h = img.size
-    # Gradio select의 좌표는 이미지 픽셀 좌표 기준
-    x = int(clamp(x, 0, w - 1))
-    y = int(clamp(y, 0, h - 1))
-    r, g, b = img.getpixel((x, y))
-    return rgb_to_hex(r, g, b)
-
-
-# -----------------------------
-# HTML 렌더링 유틸 (스와치/표)
-# -----------------------------
-
-def render_swatch(hex_color: str, subtitle: str = "") -> str:
-    return f'''
-    <div style="display:flex;align-items:center;gap:16px;">
-      <div style="width:120px;height:120px;border:2px solid #ddd;border-radius:8px; background:{hex_color}"></div>
-      <div style="font-size:14px;line-height:1.6">
-        <div><b>선택 색상</b> {subtitle}</div>
-        <div>HEX: <code>{hex_color}</code></div>
-      </div>
-    </div>
-    '''
-
-
-def render_score(score: int, label: str) -> str:
-    return f'''
-    <div style="display:flex;align-items:center;gap:12px;">
-      <progress value="{score}" max="100" style="width:240px;height:16px"></progress>
-      <div style="font-weight:600;">{score} / 100</div>
-      <div style="padding:4px 8px;border-radius:9999px;border:1px solid #ddd;background:#f6f6f6;color:#374151;">{label}</div>
-    </div>
-    '''
-
-def render_nearest(color_info: Dict, delta_e: float, cat: str) -> str:
-    name = {"base": "베이스", "accent": "엑센트", "avoid": "피해야 할"}.get(cat, cat)
-    hex_color = color_info["hex"]
-    color_name = color_info["name"]
-    return f'''
-    <div style="display:flex;align-items:center;gap:12px;">
-      <div>가장 가까운 팔레트({name}):</div>
-      <div style="width:24px;height:24px;border:1px solid #ccc;border-radius:4px;background:{hex_color}"></div>
-      <div>{color_name} <code>{hex_color}</code></div>
-      <div style="color:#666">DeltaE={delta_e:.1f}</div>
-    </div>
-    '''
-
-
-def render_top_colors(rows: List[Tuple[str, int, int, float]], method: Optional[str] = None) -> str:
-    # rows: (HEX, 픽셀수, 점수, deltaE), method: "Gemini" 또는 "KMeans"
-    if not rows:
-        return ""
-    trs = []
-    for hex_c, cnt, score, de in rows[:3]:
-        trs.append(
-            f"""
-            <tr>
-              <td><div style='width:20px;height:20px;border:1px solid #ccc;border-radius:4px;background:{hex_c}'></div></td>
-              <td><code>{hex_c}</code></td>
-              <td style='text-align:right'>{score}</td>
-              <td style='text-align:right'>{de:.1f}</td>
-              <td style='text-align:right'>{cnt}</td>
-            </tr>
-            """
-        )
-    method_badge = f"<span style='margin-left:8px;font-size:12px;padding:2px 6px;border:1px solid #ddd;border-radius:9999px;background:#f7f7f7'>{method}</span>" if method else ""
-    table = f"""
-    <div>
-      <div style='margin-bottom:6px;font-weight:600'>상위 3색 후보 {method_badge}</div>
-      <table style='border-collapse:collapse;width:100%;'>
-        <thead>
-          <tr style='text-align:left;border-bottom:1px solid #ddd'>
-            <th>색</th><th>HEX</th><th style='text-align:right'>점수</th><th style='text-align:right'>DeltaE</th><th style='text-align:right'>픽셀수</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(trs)}
-        </tbody>
-      </table>
-    </div>
-    """
-    return table
-
-
-def render_avoid_warning(show: bool, color_info: Optional[Dict] = None) -> str:
-    if not show or not color_info:
-        return ""
-    return (
-        "<div style='display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:8px;"
-        "background:#FFF3CD;border:1px solid #FFEEBA;color:#856404;'>"
-        f"<div style='width:20px;height:20px;border:1px solid #ccc;border-radius:4px;background:{color_info['hex']}'></div>"
-        f"<div style='color:#856404;'>경고: 피해야 할 색상인 <b style='color:#856404;'>{color_info['name']}</b>과 유사합니다.</div>"
-        "</div>"
-    )
-
-
-def render_palette_panel(palette: Dict) -> str:
-    colors = palette["spring_bright"]
-
-    def swatch(color_info: Dict) -> str:
-        hex_color = color_info["hex"]
-        name = color_info["name"]
-        return (
-            "<div style='display:flex;flex-direction:column;align-items:center;gap:6px;width:90px;'>"
-            f"<div style='width:72px;height:72px;border:1px solid #d0d0d0;border-radius:10px;background:{hex_color}'></div>"
-            f"<div style='font-size:13px;font-weight:500'>{name}</div>"
-            f"<code style='font-size:12px'>{hex_color}</code>"
-            "</div>"
-        )
-
-    sections = []
-    for title, desc, clist in [
-        ("베이스", "밝고 따뜻한 피부톤과 조화로운 기본 컬러", colors["base"]),
-        ("엑센트", "포인트로 쓰기 좋은 생기 있는 컬러", colors["accent"]),
-        ("피해야 할", "톤을 탁하게 만드는 회색기/저채도 컬러", colors["avoid"]),
-    ]:
-        body = "".join(swatch(c) for c in clist)
-        sections.append(
-            "<div style='flex:1;min-width:240px;max-width:100%;'>"
-            f"<div style='font-weight:600;margin-bottom:6px;'>{title}</div>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:10px;'>{desc}</div>"
-            f"<div style='display:flex;flex-wrap:wrap;gap:12px;'>{body}</div>"
-            "</div>"
-        )
-
-    return (
-        "<div style='display:flex;flex-wrap:wrap;gap:20px;margin-top:16px;'>"
-        + "".join(sections)
-        + "</div>"
-    )
-
-
-# -----------------------------
-# Gradio 앱 로직
-# -----------------------------
-
-PALETTE = load_palette()
-PALETTE_HTML = render_palette_panel(PALETTE)
-
-
-def sync_from_hex(hex_in: str):
-    """HEX를 기준으로 RGB/스와치를 동기화."""
-    try:
-        if not validate_hex(hex_in):
-            gr.Warning("HEX 형식이 올바르지 않습니다. 예: #FF6B5C")
-            return gr.update(), gr.update(), gr.update(), gr.update(value=render_swatch("#FFFFFF", "(올바른 HEX를 입력하세요)"))
-        r, g, b = hex_to_rgb(hex_in)
-        sw = render_swatch(hex_in, f"(RGB: {r},{g},{b})")
-        return int(r), int(g), int(b), gr.update(value=sw)
-    except Exception as e:
-        gr.Warning(f"입력 오류: {e}")
-        return gr.update(), gr.update(), gr.update(), gr.update(value=render_swatch("#FFFFFF", "(입력 오류)"))
-
-
-def sync_from_rgb(r: float, g: float, b: float):
-    """RGB를 기준으로 HEX/스와치를 동기화."""
-    try:
-        ri, gi, bi = int(r), int(g), int(b)
-        if not (0 <= ri <= 255 and 0 <= gi <= 255 and 0 <= bi <= 255):
-            gr.Warning("RGB 값은 0~255 범위여야 합니다.")
-            return gr.update(), gr.update(value=render_swatch("#FFFFFF", "(RGB 범위 오류)"))
-        hx = rgb_to_hex(ri, gi, bi)
-        sw = render_swatch(hx, f"(RGB: {ri},{gi},{bi})")
-        return hx, gr.update(value=sw)
-    except Exception as e:
-        gr.Warning(f"입력 오류: {e}")
-        return gr.update(), gr.update(value=render_swatch("#FFFFFF", "(입력 오류)"))
-
-
-def on_image_select(img: Image.Image, evt: gr.SelectData):
-    """이미지 클릭 이벤트: 해당 픽셀 색을 HEX/RGB로 반영."""
-    try:
-        if img is None:
-            gr.Warning("이미지가 없습니다. 먼저 업로드하세요.")
-            return gr.update(), gr.update(), gr.update(), gr.update()
-        x, y = int(evt.index[0]), int(evt.index[1])
-        hx = pick_color_at(img, x, y)
-        r, g, b = hex_to_rgb(hx)
-        sw = render_swatch(hx, f"(RGB: {r},{g},{b})")
-        return hx, int(r), int(g), int(b), gr.update(value=sw)
-    except Exception as e:
-        gr.Warning(f"픽셀 선택 실패: {e}")
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-
-
-def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image], api_key_in: str):
-    """분석하기: 단일 색 또는 이미지에서 상위 3색을 평가하여 결과를 출력."""
-    try:
-        key_ui = (api_key_in or "").strip()
-        key_env = os.environ.get("GEMINI_API_KEY", "").strip()
-        api_key = key_ui or key_env  # UI 우선, 없으면 ENV
-
-        chosen_hex: Optional[str] = None
-        hex_valid = validate_hex(hex_in)
-        rgb_valid = (r is not None and g is not None and b is not None and 0 <= int(r) <= 255 and 0 <= int(g) <= 255 and 0 <= int(b) <= 255)
-
-        # 우선순위: HEX 유효 -> RGB 유효 -> 이미지 추출
-        if hex_valid:
-            chosen_hex = hex_in.strip().upper()
-        elif rgb_valid:
-            chosen_hex = rgb_to_hex(int(r), int(g), int(b))
-        elif img is not None:
-            # LLM 또는 KMeans로 상위 색 추출
-            hex_list: List[str] = []
-            used_llm = False
-            krows: List[Tuple[str, int]] = []
-            if api_key:
-                try:
-                    provider = GeminiProvider(api_key=api_key)
-                    hex_list = provider.get_main_colors(img)
-                    used_llm = True
-                    print(f"[정보] LLM 추출 사용(Gemini): {hex_list}")
-                    try:
-                        gr.Info("Gemini로 이미지 색을 추출했어.")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print("[경고] LLM 추출 실패, KMeans로 폴백합니다:", str(e))
-                    try:
-                        gr.Warning("Gemini 추출에 실패해서 KMeans로 대신 분석했어.")
-                    except Exception:
-                        pass
-            if not hex_list:
-                # KMeans 폴백
-                krows = extract_colors_kmeans(img, k=5)
-                hex_list = [h for h, _ in krows[:3]]
-                print(f"[정보] KMeans 추출 사용: {[h for h,_ in krows]}")
-
-            # 상위색 평가 테이블 및 종합 점수 계산
-            rows = []
-            metrics = []
-            if not hex_list:
-                gr.Warning("이미지에서 유효한 색을 추출하지 못했습니다.")
-                return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-
-            if krows:
-                # KMeans: 픽셀 수로 가중 평균
-                for h, cnt in krows[:3]:
-                    met = score_color(h, PALETTE)
-                    metrics.append(met)
-                    rows.append((h, cnt, met["score"], met["nearest_delta_e"]))
-                total_pixels = sum(cnt for h, cnt in krows[:3])
-                if total_pixels > 0:
-                    avg_score = sum(m["score"] * r[1] for m, r in zip(metrics, rows)) / total_pixels
-                else:
-                    avg_score = sum(m["score"] for m in metrics) / len(metrics) if metrics else 0
-            else:
-                # LLM: 단순 평균
-                for h in hex_list:
-                    met = score_color(h, PALETTE)
-                    metrics.append(met)
-                    rows.append((h, 0, met["score"], met["nearest_delta_e"]))
-                avg_score = sum(m["score"] for m in metrics) / len(metrics) if metrics else 0
-
-            table_html = render_top_colors(rows, method=("Gemini" if used_llm else "KMeans"))
-            final_score = int(avg_score)
-            final_label = get_label_for_score(final_score)
-
-            # 대표 색은 첫 번째(가장 많은) 색으로 유지
-            chosen_hex = hex_list[0]
-
-            # 경고는 상위 색 중 하나라도 해당되면 표시
-            any_avoid = any(m["avoid_near"] for m in metrics)
-            avoid_color_to_show = next((m["avoid_color"] for m in metrics if m["avoid_near"]), None)
-
-            # 결과 생성
-            sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
-            score_html = render_score(final_score, final_label)
-            warn_html = render_avoid_warning(any_avoid, avoid_color_to_show)
-            
-            nearest_html = ""
-            if not any_avoid:
-                nearest_color, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
-                print(f"[정보] 이미지 종합점수={final_score}, 대표색={chosen_hex}, 가까운팔레트={nearest_color['name']}, DeltaE={nearest_de:.1f}")
-                nearest_html = render_nearest(nearest_color, nearest_de, cat)
-
-            # HEX/RGB 동기값
-            rr, gg, bb = hex_to_rgb(chosen_hex)
-            return (
-                gr.update(value=sw),
-                gr.update(value=score_html),
-                gr.update(value=nearest_html),
-                gr.update(value=table_html),
-                gr.update(value=warn_html),
-                int(rr), int(gg), int(bb),
-            )
+        ys, xs = np.where(coords == i)
+        if ys.size == 0:
+            cx = cy = 0
         else:
-            gr.Warning("유효한 HEX/RGB가 없고 이미지도 없습니다. 입력을 확인하세요.")
-            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            cx = int(xs.mean())
+            cy = int(ys.mean())
+        rows.append({
+            "hex": hex_c,
+            "count": int(counts[i]),
+            "centroid": (cx, cy),
+        })
+    rows.sort(key=lambda x: x["count"], reverse=True)
+    return rows, img
 
-        # 단일 색 평가 경로
-        met = score_color(chosen_hex, PALETTE)
-        sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
-        score_html = render_score(met["score"], met["label"]) 
-        warn_html = render_avoid_warning(met["avoid_near"], met["avoid_color"]) 
 
-        nearest_html = ""
-        if not met["avoid_near"]:
-            nearest_color, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
-            print(f"[정보] 입력색 {chosen_hex}의 가까운 팔레트: {nearest_color['name']} ({cat}), DeltaE={nearest_de:.1f}")
-            nearest_html = render_nearest(nearest_color, nearest_de, cat)
-        
-        # 단일 색이므로 상위 3색 표는 비움
-        rr, gg, bb = hex_to_rgb(chosen_hex)
+def log_score(result: ScoreBreakdown):
+    logger.info(
+        "[정보] 점수 갱신: ΔE=%.1f, HSV보정=%+.1f → 최종 %d점",
+        result.delta_e,
+        result.hsv_boost / 10.0,
+        result.score,
+    )
+
+
+def compute_score(hex_color: str, tone_id: str) -> Tuple[str, str, str, Image.Image, str, str, str]:
+    tone = REPO.load(tone_id)
+    breakdown = evaluate_color(hex_color, tone, REPO, DEFAULT_CONFIG)
+    log_score(breakdown)
+    rgb = hex_to_rgb(hex_color)
+    swatch_html = render_swatch(hex_color, rgb)
+    score_html = render_score_card(breakdown)
+    nearest_html = render_nearest_info(breakdown)
+
+    avoid_hex = breakdown.avoid["hex"] if breakdown.avoid else None
+    avoid_html = ""
+    if breakdown.avoid:
+        avoid_color_obj = next((c for c in tone.groups.get("avoid", []) if c.hex == avoid_hex), None)
+        if avoid_color_obj:
+            breakdown.avoid.setdefault("tags", avoid_color_obj.tags)
+        if breakdown.avoid.get("distance", 999) < 12:
+            avoid_html = avoid_message(breakdown, tone_id)
+    palette_html = render_palette_panel(tone_id, breakdown.nearest["hex"], avoid_hex)
+    recommendation_html = render_recommendation_section(breakdown, tone, hex_color)
+    wheel_img = generate_colorwheel_image(hex_color, tone, breakdown.nearest["hex"], avoid_hex)
+    return swatch_html, score_html, nearest_html, wheel_img, palette_html, recommendation_html, avoid_html
+
+
+def pack_color_outputs(
+    hex_value: str,
+    computed: Tuple[str, str, str, Image.Image, str, str, str],
+    annotated: Optional[Image.Image] = None,
+    rgb: Optional[Tuple[int, int, int]] = None,
+):
+    swatch_html, score_html, nearest_html, wheel_img, palette_html, recommendation_html, avoid_html = computed
+    rgb_values = rgb or hex_to_rgb(hex_value)
+    return (
+        hex_value,
+        swatch_html,
+        score_html,
+        nearest_html,
+        wheel_img,
+        palette_html,
+        recommendation_html,
+        avoid_html,
+        annotated if annotated is not None else gr.update(),
+        hex_value,
+        rgb_values[0],
+        rgb_values[1],
+        rgb_values[2],
+    )
+
+
+def on_hex_change(hex_value: str, tone_id: str):
+    normalized = normalize_color_input(hex_value)
+    if not normalized:
+        gr.Warning("HEX 형식이 올바르지 않아. 예: #FF6B5C")
         return (
-            gr.update(value=sw),
-            gr.update(value=score_html),
-            gr.update(value=nearest_html),
-            "",  # top colors html
-            gr.update(value=warn_html),
-            int(rr), int(gg), int(bb),
+            hex_value,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=None),
+            gr.update(),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(),
+            hex_value,
+            gr.update(),
+            gr.update(),
+            gr.update(),
         )
-    except Exception as e:
-        gr.Warning(f"분석 중 오류가 발생했습니다: {e}")
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    outputs = compute_score(normalized, tone_id)
+    return pack_color_outputs(normalized, outputs)
 
 
-def build_ui():
-    with gr.Blocks(title="봄 브라이트 컬러 매칭") as demo:
-        gr.Markdown("# 봄 브라이트 컬러 매칭 (Try Spring Bright!)")
-        gr.Markdown(
-            "- 가이드: 그레이/멜란지/스모키/차콜 계열은 점수 하향 경향이 있습니다.\n"
-            "- 입력: HEX/RGB 또는 이미지 업로드 후 분석을 눌러보세요. 이미지 클릭으로 픽셀 색을 선택할 수 있습니다."
+def on_rgb_change(r: float, g: float, b: float, tone_id: str):
+    try:
+        hx = rgb_to_hex(int(r), int(g), int(b))
+    except ValueError as exc:
+        gr.Warning(str(exc))
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=None),
+            gr.update(),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
         )
+    return on_hex_change(hx, tone_id)
 
+
+def on_tone_change(tone_id: str, hex_value: str, r: float, g: float, b: float):
+    if validate_hex(hex_value):
+        return on_hex_change(hex_value, tone_id)
+    return on_rgb_change(r, g, b, tone_id)
+
+
+def on_image_click(img: Image.Image, evt: gr.SelectData, tone_id: str):
+    if img is None:
+        gr.Warning("먼저 이미지를 올려줘.")
+        return
+    if evt is None:
+        return
+    x, y = int(evt.index[0]), int(evt.index[1])
+    hx = rgb_to_hex(*img.convert("RGB").getpixel((x, y)))
+    computed = compute_score(hx, tone_id)
+    marked = draw_markers(img, [Marker(x=x, y=y, color=hex_to_rgb(hx), label="픽")])
+    return pack_color_outputs(hx, computed, annotated=marked)
+
+
+def on_image_upload(img: Image.Image, tone_id: str):
+    if img is None:
+        return gr.update()
+    rows, resized = extract_colors_kmeans(img)
+    markers = []
+    top_html_parts = []
+    for idx, row in enumerate(rows[:3], 1):
+        tone = REPO.load(tone_id)
+        breakdown = evaluate_color(row["hex"], tone, REPO, DEFAULT_CONFIG)
+        top_html_parts.append(
+            f"<tr><td>{idx}</td><td><code>{row['hex']}</code></td><td>{breakdown.score}</td><td>{breakdown.delta_e:.1f}</td><td>{row['count']}</td></tr>"
+        )
+        markers.append(Marker(x=row["centroid"][0], y=row["centroid"][1], color=hex_to_rgb(row["hex"]), label=f"#{idx}"))
+    table_html = """
+    <table style='width:100%;border-collapse:collapse;font-size:12px;'>
+      <thead><tr style='border-bottom:1px solid #ccc'><th>순위</th><th>HEX</th><th>점수</th><th>ΔE</th><th>픽셀</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """.format(rows="".join(top_html_parts))
+    annotated = draw_markers(resized, markers) if markers else resized
+    gr.Info("상위 3색을 추출했어. 마커를 참고해봐!")
+    return table_html, annotated
+
+
+def on_image_select_event(img: Image.Image, evt: gr.SelectData, tone_label: str):
+    tone_id = resolve_tone_id(tone_label)
+    if img is None or evt is None:
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=None),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+    box = getattr(evt, "bounding_box", None) or getattr(evt, "region", None)
+    if not box:
+        points = getattr(evt, "selected_points", None)
+        if points and len(points) > 1:
+            box = {
+                "x0": min(p[0] for p in points),
+                "y0": min(p[1] for p in points),
+                "x1": max(p[0] for p in points),
+                "y1": max(p[1] for p in points),
+            }
+    if box:
+        x0 = int(box.get("x0", box.get("x", 0)))
+        y0 = int(box.get("y0", box.get("y", 0)))
+        x1 = int(box.get("x1", box.get("x", 0) + box.get("width", 0)))
+        y1 = int(box.get("y1", box.get("y", 0) + box.get("height", 0)))
+        hx, rgb = average_color(img, x0, y0, x1, y1)
+        tone = REPO.load(tone_id)
+        breakdown = evaluate_color(hx, tone, REPO, DEFAULT_CONFIG)
+        logger.info("[정보] 선택 영역 평균색: %s (LAB 대비 포함) → %d점", hx, breakdown.score)
+        computed = compute_score(hx, tone_id)
+        boxed = draw_selection_box(img, x0, y0, x1, y1)
+        return pack_color_outputs(hx, computed, annotated=boxed, rgb=rgb)
+    return on_image_click(img, evt, tone_id)
+
+
+def build_ui() -> gr.Blocks:
+    with gr.Blocks(title="봄 브라이트 컬러 매칭 업그레이드", css="body{background:#faf8f5;}") as demo:
+        gr.Markdown("""
+        # 봄 브라이트 컬러 매칭 실시간 체커
+        따뜻함 · 채도 · 명도를 동시에 살펴보면서, 지금 선택한 색이 얼마나 봄 브라이트 톤에 어울리는지 150ms 디바운스로 즉시 확인해봐.
+        """)
         with gr.Row():
             with gr.Column(scale=1):
-                hex_in = gr.Textbox(label="HEX 입력 (#RRGGBB)", placeholder="#FF6B5C")
+                tone_dropdown = gr.Dropdown(choices=[label for _, label in tone_options()], label="분석 톤", value=tone_options()[0][1], interactive=True)
+                hex_box = gr.Textbox(label="HEX 입력", value="#FF6B5C", max_lines=1)
+                color_picker = gr.ColorPicker(label="컬러 피커", value="#FF6B5C")
                 with gr.Row():
-                    r_in = gr.Number(label="R", value=255, precision=0)
-                    g_in = gr.Number(label="G", value=107, precision=0)
-                    b_in = gr.Number(label="B", value=92, precision=0)
-                img_in = gr.Image(label="이미지 업로드", type="pil")
-                api_key = gr.Textbox(
-                    label="Gemini API 키 (이미지 색 추출용, 선택)",
-                    type="password",
-                    info="이미지 업로드 시 상위 3색을 LLM으로 추출해. 유효한 HEX/RGB를 입력한 경우엔 LLM을 쓰지 않아. 오류나 미설치 시 자동으로 KMeans로 전환돼."
-                )
-                analyze_btn = gr.Button("분석하기")
-
-            with gr.Column(scale=1):
+                    r_slider = gr.Slider(0, 255, value=255, step=1, label="R")
+                    g_slider = gr.Slider(0, 255, value=107, step=1, label="G")
+                    b_slider = gr.Slider(0, 255, value=92, step=1, label="B")
                 swatch_out = gr.HTML(label="선택 색상")
-                score_out = gr.HTML(label="일치도 점수")
+                score_out = gr.HTML(label="일치도 점수(봄 브라이트 적합도)")
                 nearest_out = gr.HTML(label="가까운 팔레트")
-                top_colors_out = gr.HTML(label="상위 3색")
-                warn_out = gr.HTML(label="경고")
-                gr.HTML(value=PALETTE_HTML, label="팔레트 미리보기")
+                colorwheel_out = gr.Image(label="색상환 미니 뷰", image_mode="RGBA")
+            with gr.Column(scale=1):
+                palette_out = gr.HTML(label="팔레트 미리보기")
+                recommendation_out = gr.HTML(label="대안 추천")
+                avoid_out = gr.HTML(label="주의 안내")
+                gr.HTML(render_help_panel(), label="가이드")
+        with gr.Row():
+            with gr.Column():
+                upload = gr.Image(label="이미지 업로드", type="pil")
+                analysis_table = gr.HTML(label="추출 색상 점수표")
+            with gr.Column():
+                annotated = gr.Image(label="마커/드래그 결과", type="pil")
+        gr.Markdown("※ 이미지 위를 드래그하면 선택 영역 평균색을 계산해.")
 
-        # 동기화 이벤트: HEX -> RGB/스와치
-        hex_in.change(fn=sync_from_hex, inputs=[hex_in], outputs=[r_in, g_in, b_in, swatch_out])
-        # RGB -> HEX/스와치 (각 Number 변경 시 동작)
-        r_in.change(fn=sync_from_rgb, inputs=[r_in, g_in, b_in], outputs=[hex_in, swatch_out])
-        g_in.change(fn=sync_from_rgb, inputs=[r_in, g_in, b_in], outputs=[hex_in, swatch_out])
-        b_in.change(fn=sync_from_rgb, inputs=[r_in, g_in, b_in], outputs=[hex_in, swatch_out])
+        # 초기 렌더링
+        initial_outputs = compute_score("#FF6B5C", DEFAULT_TONE)
+        swatch_out.value, score_out.value, nearest_out.value, colorwheel_out.value, palette_out.value, recommendation_out.value, avoid_out.value = initial_outputs
+        analysis_table.value = ""
+        annotated.value = None
 
-        # 이미지 클릭 스포이드
-        img_in.select(fn=on_image_select, inputs=[img_in], outputs=[hex_in, r_in, g_in, b_in, swatch_out])
+        # 이벤트 연결
+        tone_dropdown.change(
+            fn=lambda tone_label, hex_value, r, g, b: on_tone_change(resolve_tone_id(tone_label), hex_value, r, g, b),
+            inputs=[tone_dropdown, hex_box, r_slider, g_slider, b_slider],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+        )
 
-        # 분석 버튼
-        analyze_btn.click(
-            fn=analyze,
-            inputs=[hex_in, r_in, g_in, b_in, img_in, api_key],
-            outputs=[swatch_out, score_out, nearest_out, top_colors_out, warn_out, r_in, g_in, b_in],
+        hex_box.input(
+            fn=lambda hx, tone_label: on_hex_change(hx, resolve_tone_id(tone_label)),
+            inputs=[hex_box, tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+            debounce=0.15,
+        )
+        color_picker.input(
+            fn=lambda hx, tone_label: on_hex_change(hx, resolve_tone_id(tone_label)),
+            inputs=[color_picker, tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+            debounce=0.15,
+        )
+        r_slider.input(
+            fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
+            inputs=[r_slider, g_slider, b_slider, tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+            debounce=0.15,
+        )
+        g_slider.input(
+            fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
+            inputs=[r_slider, g_slider, b_slider, tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+            debounce=0.15,
+        )
+        b_slider.input(
+            fn=lambda r, g, b, tone_label: on_rgb_change(r, g, b, resolve_tone_id(tone_label)),
+            inputs=[r_slider, g_slider, b_slider, tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
+            debounce=0.15,
+        )
+
+        upload.change(
+            fn=lambda img, tone_label: on_image_upload(img, resolve_tone_id(tone_label)),
+            inputs=[upload, tone_dropdown],
+            outputs=[analysis_table, annotated],
+        )
+        upload.select(
+            fn=on_image_select_event,
+            inputs=[upload, gr.EventData(), tone_dropdown],
+            outputs=[hex_box, swatch_out, score_out, nearest_out, colorwheel_out, palette_out, recommendation_out, avoid_out, annotated, color_picker, r_slider, g_slider, b_slider],
         )
 
     return demo
 
 
 if __name__ == "__main__":
-    # 콘솔 로그는 한국어로만 출력
-    print("Gradio 앱을 시작합니다. 브라우저에서 접속하세요.")
+    print("Gradio 앱을 시작할게. 브라우저에서 확인해줘.")
     app = build_ui()
-    # 모바일에서도 보이도록 compact 레이아웃 유지
     app.launch()
