@@ -96,20 +96,33 @@ def nearest_palette(
     hex_color: str,
     palette: Dict,
     include: Iterable[str] = ("base", "accent"),
-) -> Tuple[str, float, str]:
-    """가장 가까운 팔레트 색상 HEX, DeltaE, 분류를 반환.
+) -> Tuple[Dict, float, str]:
+    """가장 가까운 팔레트 색상 정보(dict), DeltaE, 분류를 반환.
 
     include로 카테고리 집합을 제한할 수 있다. 기본은 (base, accent)만 사용.
     경고 판단은 별도로 avoid에 대해 계산한다.
     """
     lab = hex_to_lab(hex_color)
-    best_hex, best_d, best_cat = None, 1e9, ""
+    best_color, best_d, best_cat = None, 1e9, ""
     for cat in include:
-        for h in palette["spring_bright"][cat]:
+        for color_info in palette["spring_bright"][cat]:
+            h = color_info["hex"]
             d = delta_e_ciede2000(lab, hex_to_lab(h))
             if d < best_d:
-                best_hex, best_d, best_cat = h, d, cat
-    return best_hex or "#000000", float(best_d), best_cat
+                best_color, best_d, best_cat = color_info, d, cat
+    return best_color or {"name": "N/A", "hex": "#000000"}, float(best_d), best_cat
+
+
+def get_label_for_score(score: int) -> str:
+    """점수에 따라 판정 라벨을 반환."""
+    if score >= 90:
+        return "최상(완전 봄 브라이트)"
+    elif score >= 75:
+        return "좋음(강추)"
+    elif score >= 60:
+        return "보통(상황에 따라 가능)"
+    else:
+        return "비추천(탁하거나 톤 안맞음)"
 
 
 def score_color(hex_color: str, palette: Dict) -> Dict:
@@ -118,9 +131,10 @@ def score_color(hex_color: str, palette: Dict) -> Dict:
     반환 dict:
     - score: int(0~100)
     - label: str
-    - nearest_hex: str
+    - nearest_color: {name, hex}
     - nearest_delta_e: float
     - avoid_near: bool (DeltaE<20)
+    - avoid_color: {name, hex} | None
     - hsv: (h,s,v) 0..1
     """
     r, g, b = hex_to_rgb(hex_color)
@@ -129,19 +143,21 @@ def score_color(hex_color: str, palette: Dict) -> Dict:
     # 팔레트 멤버십(정확 일치) 확인
     hex_up = hex_color.strip().upper()
     pal = palette["spring_bright"]
-    in_base = hex_up in [h.upper() for h in pal["base"]]
-    in_accent = hex_up in [h.upper() for h in pal["accent"]]
-    in_avoid = hex_up in [h.upper() for h in pal["avoid"]]
+    in_base = hex_up in [c["hex"].upper() for c in pal["base"]]
+    in_accent = hex_up in [c["hex"].upper() for c in pal["accent"]]
+    in_avoid = hex_up in [c["hex"].upper() for c in pal["avoid"]]
 
     # 팔레트(base+accent)와의 최소 거리만으로 근접도 평가
-    best_hex, best_d, best_cat = nearest_palette(hex_color, palette, include=("base", "accent"))
+    best_color, best_d, best_cat = nearest_palette(hex_color, palette, include=("base", "accent"))
 
     # 피해야 할 색과의 거리(점수 페널티 및 경고 판단)
     avoid_d = 1e9
-    for h in palette["spring_bright"]["avoid"]:
-        d = delta_e_ciede2000(lab, hex_to_lab(h))
+    avoid_color = None
+    for c in palette["spring_bright"]["avoid"]:
+        d = delta_e_ciede2000(lab, hex_to_lab(c["hex"]))
         if d < avoid_d:
             avoid_d = d
+            avoid_color = c
     # 경고 임계값을 보수적으로 낮춤(과도 경고 방지)
     AVOID_WARN_DE = 12.0
     avoid_near = avoid_d < AVOID_WARN_DE
@@ -187,21 +203,15 @@ def score_color(hex_color: str, palette: Dict) -> Dict:
         avoid_near = True
 
     # 판정 라벨
-    if score >= 90:
-        label = "최상(완전 봄 브라이트)"
-    elif score >= 75:
-        label = "좋음(강추)"
-    elif score >= 60:
-        label = "보통(상황에 따라 가능)"
-    else:
-        label = "비추천(탁하거나 톤 안맞음)"
+    label = get_label_for_score(score)
 
     return {
         "score": int(score),
         "label": label,
-        "nearest_hex": best_hex,
+        "nearest_color": best_color,
         "nearest_delta_e": float(best_d),
         "avoid_near": bool(avoid_near),
+        "avoid_color": avoid_color,
         "hsv": (float(_), float(s), float(v)),
     }
 
@@ -291,18 +301,19 @@ def render_score(score: int, label: str) -> str:
     <div style="display:flex;align-items:center;gap:12px;">
       <progress value="{score}" max="100" style="width:240px;height:16px"></progress>
       <div style="font-weight:600;">{score} / 100</div>
-      <div style="padding:4px 8px;border-radius:9999px;border:1px solid #ddd;background:#f6f6f6;">{label}</div>
+      <div style="padding:4px 8px;border-radius:9999px;border:1px solid #ddd;background:#f6f6f6;color:#374151;">{label}</div>
     </div>
     '''
 
-
-def render_nearest(hex_color: str, delta_e: float, cat: str) -> str:
+def render_nearest(color_info: Dict, delta_e: float, cat: str) -> str:
     name = {"base": "베이스", "accent": "엑센트", "avoid": "피해야 할"}.get(cat, cat)
+    hex_color = color_info["hex"]
+    color_name = color_info["name"]
     return f'''
     <div style="display:flex;align-items:center;gap:12px;">
       <div>가장 가까운 팔레트({name}):</div>
       <div style="width:24px;height:24px;border:1px solid #ccc;border-radius:4px;background:{hex_color}"></div>
-      <code>{hex_color}</code>
+      <div>{color_name} <code>{hex_color}</code></div>
       <div style="color:#666">DeltaE={delta_e:.1f}</div>
     </div>
     '''
@@ -344,23 +355,28 @@ def render_top_colors(rows: List[Tuple[str, int, int, float]], method: Optional[
     return table
 
 
-def render_avoid_warning(show: bool) -> str:
-    if not show:
+def render_avoid_warning(show: bool, color_info: Optional[Dict] = None) -> str:
+    if not show or not color_info:
         return ""
     return (
-        "<div style='display:inline-block;padding:6px 10px;border-radius:8px;"
-        "background:#FFF3CD;border:1px solid #FFEEBA;color:#8A6D3B;'>"
-        "경고: 피해야 할 색상과 매우 유사합니다 (DeltaE<20)" "</div>"
+        "<div style='display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:8px;"
+        "background:#FFF3CD;border:1px solid #FFEEBA;color:#856404;'>"
+        f"<div style='width:20px;height:20px;border:1px solid #ccc;border-radius:4px;background:{color_info['hex']}'></div>"
+        f"<div style='color:#856404;'>경고: 피해야 할 색상인 <b style='color:#856404;'>{color_info['name']}</b>과 유사합니다.</div>"
+        "</div>"
     )
 
 
 def render_palette_panel(palette: Dict) -> str:
     colors = palette["spring_bright"]
 
-    def swatch(hex_color: str) -> str:
+    def swatch(color_info: Dict) -> str:
+        hex_color = color_info["hex"]
+        name = color_info["name"]
         return (
             "<div style='display:flex;flex-direction:column;align-items:center;gap:6px;width:90px;'>"
             f"<div style='width:72px;height:72px;border:1px solid #d0d0d0;border-radius:10px;background:{hex_color}'></div>"
+            f"<div style='font-size:13px;font-weight:500'>{name}</div>"
             f"<code style='font-size:12px'>{hex_color}</code>"
             "</div>"
         )
@@ -483,35 +499,53 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
                 hex_list = [h for h, _ in krows[:3]]
                 print(f"[정보] KMeans 추출 사용: {[h for h,_ in krows]}")
 
-            # 상위색 평가 테이블 작성 및 첫 번째 색을 대표로 사용
+            # 상위색 평가 테이블 및 종합 점수 계산
             rows = []
-            if krows:
-                # KMeans 결과 기반: 실제 픽셀수 사용
-                for h, cnt in krows[:3]:
-                    met = score_color(h, PALETTE)
-                    rows.append((h, cnt, met["score"], met["nearest_delta_e"]))
-            else:
-                # LLM 결과 기반: 픽셀수는 미정(0)
-                for h in hex_list:
-                    met = score_color(h, PALETTE)
-                    rows.append((h, 0, met["score"], met["nearest_delta_e"]))
-            table_html = render_top_colors(rows, method=("Gemini" if used_llm else "KMeans"))
-
-            # 대표 색 선택: 첫 번째
-            if hex_list:
-                chosen_hex = hex_list[0]
-            else:
+            metrics = []
+            if not hex_list:
                 gr.Warning("이미지에서 유효한 색을 추출하지 못했습니다.")
                 return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
-            # 대표 색 기반 결과 생성
-            met = score_color(chosen_hex, PALETTE)
+            if krows:
+                # KMeans: 픽셀 수로 가중 평균
+                for h, cnt in krows[:3]:
+                    met = score_color(h, PALETTE)
+                    metrics.append(met)
+                    rows.append((h, cnt, met["score"], met["nearest_delta_e"]))
+                total_pixels = sum(cnt for h, cnt in krows[:3])
+                if total_pixels > 0:
+                    avg_score = sum(m["score"] * r[1] for m, r in zip(metrics, rows)) / total_pixels
+                else:
+                    avg_score = sum(m["score"] for m in metrics) / len(metrics) if metrics else 0
+            else:
+                # LLM: 단순 평균
+                for h in hex_list:
+                    met = score_color(h, PALETTE)
+                    metrics.append(met)
+                    rows.append((h, 0, met["score"], met["nearest_delta_e"]))
+                avg_score = sum(m["score"] for m in metrics) / len(metrics) if metrics else 0
+
+            table_html = render_top_colors(rows, method=("Gemini" if used_llm else "KMeans"))
+            final_score = int(avg_score)
+            final_label = get_label_for_score(final_score)
+
+            # 대표 색은 첫 번째(가장 많은) 색으로 유지
+            chosen_hex = hex_list[0]
+
+            # 경고는 상위 색 중 하나라도 해당되면 표시
+            any_avoid = any(m["avoid_near"] for m in metrics)
+            avoid_color_to_show = next((m["avoid_color"] for m in metrics if m["avoid_near"]), None)
+
+            # 결과 생성
             sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
-            score_html = render_score(met["score"], met["label"]) 
-            nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
-            print(f"[정보] 대표색 {chosen_hex}의 가까운 팔레트: {nearest_hex} ({cat}), DeltaE={nearest_de:.1f}")
-            nearest_html = render_nearest(nearest_hex, nearest_de, cat)
-            warn_html = render_avoid_warning(met["avoid_near"]) 
+            score_html = render_score(final_score, final_label)
+            warn_html = render_avoid_warning(any_avoid, avoid_color_to_show)
+            
+            nearest_html = ""
+            if not any_avoid:
+                nearest_color, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
+                print(f"[정보] 이미지 종합점수={final_score}, 대표색={chosen_hex}, 가까운팔레트={nearest_color['name']}, DeltaE={nearest_de:.1f}")
+                nearest_html = render_nearest(nearest_color, nearest_de, cat)
 
             # HEX/RGB 동기값
             rr, gg, bb = hex_to_rgb(chosen_hex)
@@ -531,10 +565,14 @@ def analyze(hex_in: str, r: float, g: float, b: float, img: Optional[Image.Image
         met = score_color(chosen_hex, PALETTE)
         sw = render_swatch(chosen_hex, f"(RGB: {','.join(map(str, hex_to_rgb(chosen_hex)))})")
         score_html = render_score(met["score"], met["label"]) 
-        nearest_hex, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
-        print(f"[정보] 입력색 {chosen_hex}의 가까운 팔레트: {nearest_hex} ({cat}), DeltaE={nearest_de:.1f}")
-        nearest_html = render_nearest(nearest_hex, nearest_de, cat)
-        warn_html = render_avoid_warning(met["avoid_near"]) 
+        warn_html = render_avoid_warning(met["avoid_near"], met["avoid_color"]) 
+
+        nearest_html = ""
+        if not met["avoid_near"]:
+            nearest_color, nearest_de, cat = nearest_palette(chosen_hex, PALETTE, include=("base", "accent"))
+            print(f"[정보] 입력색 {chosen_hex}의 가까운 팔레트: {nearest_color['name']} ({cat}), DeltaE={nearest_de:.1f}")
+            nearest_html = render_nearest(nearest_color, nearest_de, cat)
+        
         # 단일 색이므로 상위 3색 표는 비움
         rr, gg, bb = hex_to_rgb(chosen_hex)
         return (

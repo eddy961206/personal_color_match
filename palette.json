@@ -1,8 +1,29 @@
 {
   "spring_bright": {
-    "base": ["#FFF7E6", "#FDF0D5", "#EED9B6", "#FFE48A", "#C98A3F", "#103A64"],
-    "accent": ["#FF6B5C", "#FF3B30", "#FFA07A", "#FFC107", "#5CD85C", "#58E0C0", "#6DCFF6", "#0BB3A6"],
-    "avoid": ["#B5B5B5", "#B9AA96", "#7DA1B1", "#B08BA0", "#444444"]
+    "base": [
+      { "name": "아이보리", "hex": "#FFF7E6" },
+      { "name": "크림", "hex": "#FDF0D5" },
+      { "name": "라이트 베이지", "hex": "#EED9B6" },
+      { "name": "버터 옐로", "hex": "#FFE48A" },
+      { "name": "샌드/카멜", "hex": "#C98A3F" },
+      { "name": "네이비", "hex": "#103A64" }
+    ],
+    "accent": [
+      { "name": "코랄", "hex": "#FF6B5C" },
+      { "name": "토마토 레드", "hex": "#FF3B30" },
+      { "name": "피치/살구", "hex": "#FFA07A" },
+      { "name": "망고 옐로", "hex": "#FFC107" },
+      { "name": "애플 그린", "hex": "#5CD85C" },
+      { "name": "민트", "hex": "#58E0C0" },
+      { "name": "아쿠아", "hex": "#6DCFF6" },
+      { "name": "티얼(청록)", "hex": "#0BB3A6" }
+    ],
+    "avoid": [
+      { "name": "헤더 그레이(멜란지)", "hex": "#B5B5B5" },
+      { "name": "스모키 베이지", "hex": "#B9AA96" },
+      { "name": "더스티 블루", "hex": "#7DA1B1" },
+      { "name": "모브(그레이핑크)", "hex": "#B08BA0" },
+      { "name": "차콜", "hex": "#444444" }
+    ]
   }
 }
-
