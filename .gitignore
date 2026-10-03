@@ -1,4 +1,10 @@
-/req.md
+node_modules/
+dist/
 .venv/
-.env
 __pycache__/
+.pytest_cache/
+test-output/
+.env
+.env.*
+!.env.example
+.DS_Store

@@ -1,8 +1,0 @@
-gradio>=5.47.2
-Pillow>=10.3.0
-numpy>=1.26.4
-scikit-image>=0.22.0
-scikit-learn>=1.4.2
-google-generativeai>=0.7.2
-pytest>=8.2.0
-
